@@ -1,16 +1,21 @@
 """
-VectorStore: embeds assessments and builds a FAISS index.
+VectorStore: builds and queries a FAISS index.
 
-Key fix: SentenceTransformer is imported and loaded ONCE during
-load_or_build() at startup — never lazily inside a request handler.
-This prevents MemoryError from repeated heavy imports under load.
+Embeddings use the HuggingFace Inference API instead of a local
+SentenceTransformer model. This keeps memory under 150MB on Render's
+free tier (local torch+sentence-transformers needs ~1.5GB and causes OOM).
+
+The FAISS index is built once and persisted to disk. On subsequent
+startups it loads from disk in <1s with zero API calls.
 """
 
 import logging
 import os
 import pickle
+import time
 from typing import List, Tuple
 
+import httpx
 import numpy as np
 
 from app.models.assessment import Assessment
@@ -20,25 +25,27 @@ logger = logging.getLogger(__name__)
 
 _INDEX_PATH = os.path.join(os.path.dirname(__file__), "../../data/embeddings.faiss")
 _META_PATH  = os.path.join(os.path.dirname(__file__), "../../data/metadata.pkl")
-_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+_HF_API_URL = (
+    "https://api-inference.huggingface.co/models/"
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+_HF_TOKEN   = os.getenv("HF_TOKEN", "")   # optional but increases rate limits
+_BATCH_SIZE = 32
 
 
 class VectorStore:
     def __init__(self, catalog: CatalogStore):
         self.catalog = catalog
-        self._index = None
+        self._index  = None
         self._ids: List[str] = []
-        self._model = None          # set once in load_or_build()
+        # _model kept for API compatibility with any code that checks it
+        self._model  = "hf-api"
 
-    # ── Public API ──────────────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def load_or_build(self) -> None:
-        """
-        Called once at application startup.
-        Loads the embedding model first, then loads or builds the FAISS index.
-        Doing this here (not inside search()) keeps the request path memory-safe.
-        """
-        self._load_model()          # import + load weights exactly once
+        """Called once at startup. Loads index from disk or builds via HF API."""
         if os.path.exists(_INDEX_PATH) and os.path.exists(_META_PATH):
             self._load()
         else:
@@ -49,13 +56,7 @@ class VectorStore:
         if self._index is None or not self._ids:
             return []
 
-        if self._model is None:
-            # Defensive: should not happen after load_or_build(), but handle gracefully
-            logger.error("Embedding model not loaded — returning empty results")
-            return []
-
-        vec = self._embed([query])[0]
-        vec = vec / (np.linalg.norm(vec) + 1e-10)
+        vec = self._embed_batch([query])[0]
         vec = np.array([vec], dtype="float32")
 
         k = min(top_k, len(self._ids))
@@ -70,54 +71,69 @@ class VectorStore:
                 results.append((assessment, float(dist)))
         return results
 
-    # ── Internal ────────────────────────────────────────────────────────────
+    # ── Embedding ─────────────────────────────────────────────────────────────
 
-    def _load_model(self) -> None:
-        """Import sentence_transformers and load weights. Called once at startup."""
-        if self._model is not None:
-            return
-        try:
-            # Import here so the MemoryError (if any) surfaces at startup with
-            # a clear message, not silently inside a request handler.
-            from sentence_transformers import SentenceTransformer
-            logger.info("Loading embedding model %s …", _MODEL_NAME)
-            self._model = SentenceTransformer(_MODEL_NAME)
-            logger.info("Embedding model loaded.")
-        except MemoryError:
-            logger.critical(
-                "MemoryError while loading SentenceTransformer. "
-                "Free RAM and restart, or switch to a lighter model."
-            )
-            raise
-        except Exception as e:
-            logger.critical("Failed to load embedding model: %s", e)
-            raise
+    def _embed_batch(self, texts: List[str]) -> np.ndarray:
+        """Embed texts via HF Inference API in batches. Returns L2-normalised vectors."""
+        headers = {"Content-Type": "application/json"}
+        if _HF_TOKEN:
+            headers["Authorization"] = f"Bearer {_HF_TOKEN}"
 
-    def _embed(self, texts: List[str]) -> np.ndarray:
-        vecs = self._model.encode(
-            texts,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            batch_size=32,          # explicit batch size avoids OOM on large inputs
-        )
-        return np.array(vecs, dtype="float32")
+        all_vecs = []
+        for i in range(0, len(texts), _BATCH_SIZE):
+            batch = texts[i : i + _BATCH_SIZE]
+            vecs  = self._call_hf_api(batch, headers)
+            all_vecs.append(vecs)
+
+        combined = np.vstack(all_vecs).astype("float32")
+        norms    = np.linalg.norm(combined, axis=1, keepdims=True) + 1e-10
+        return combined / norms
+
+    def _call_hf_api(self, texts: List[str], headers: dict) -> np.ndarray:
+        """Single HF API call with one retry on 503 (model still loading)."""
+        payload = {"inputs": texts, "options": {"wait_for_model": True}}
+
+        for attempt in range(2):
+            try:
+                resp = httpx.post(
+                    _HF_API_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=60.0,
+                )
+                if resp.status_code == 503 and attempt == 0:
+                    logger.warning("HF model loading (503) — retrying in 20s …")
+                    time.sleep(20)
+                    continue
+                resp.raise_for_status()
+                return np.array(resp.json(), dtype="float32")
+            except httpx.HTTPStatusError as e:
+                logger.error("HF API HTTP error: %s", e)
+                raise
+            except Exception as e:
+                logger.error("HF API call failed: %s", e)
+                raise
+
+        raise RuntimeError("HF Inference API failed after retry.")
+
+    # ── Index build / load ────────────────────────────────────────────────────
 
     def _build(self) -> None:
         import faiss
 
         assessments = self.catalog.all()
         if not assessments:
-            logger.warning("Catalog is empty — skipping index build")
+            logger.warning("Catalog empty — skipping index build.")
             return
 
-        logger.info("Embedding %d assessments …", len(assessments))
-        texts  = [a.embed_text  for a in assessments]
-        self._ids = [a.entity_id for a in assessments]
+        logger.info("Embedding %d assessments via HF API …", len(assessments))
+        texts     = [a.embed_text for a in assessments]
+        self._ids = [a.entity_id  for a in assessments]
 
-        vecs = self._embed(texts)
+        vecs = self._embed_batch(texts)
         dim  = vecs.shape[1]
 
-        self._index = faiss.IndexFlatIP(dim)  # Inner Product on L2-norm = cosine
+        self._index = faiss.IndexFlatIP(dim)
         self._index.add(vecs)
 
         os.makedirs(os.path.dirname(_INDEX_PATH), exist_ok=True)
@@ -125,7 +141,7 @@ class VectorStore:
         with open(_META_PATH, "wb") as f:
             pickle.dump(self._ids, f)
 
-        logger.info("Index built and saved (%d vectors, dim=%d)", len(self._ids), dim)
+        logger.info("Index built and saved (%d vectors, dim=%d).", len(self._ids), dim)
 
     def _load(self) -> None:
         import faiss
@@ -134,4 +150,4 @@ class VectorStore:
         self._index = faiss.read_index(_INDEX_PATH)
         with open(_META_PATH, "rb") as f:
             self._ids = pickle.load(f)
-        logger.info("Index loaded (%d vectors)", len(self._ids))
+        logger.info("Index loaded (%d vectors).", len(self._ids))
